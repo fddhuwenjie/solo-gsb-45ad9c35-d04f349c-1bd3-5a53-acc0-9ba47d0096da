@@ -34,6 +34,23 @@ _BGP_PLANS_DDL = """
             );
 """
 
+# One row per completed one-shot address provisioning.  Kept as a constant so
+# the schema migration below can rebuild the table with the identical
+# definition.  See the matching comment inside init_db for why allocation_id
+# is deliberately a plain historical reference rather than an FK.
+_ADDRESS_PROVISIONS_DDL = """
+            CREATE TABLE IF NOT EXISTS address_provisions (
+                plan_id        TEXT    PRIMARY KEY
+                                  REFERENCES bgp_plans(plan_id) ON DELETE CASCADE,
+                pool_id        INTEGER NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+                allocation_id  INTEGER NOT NULL,
+                request_id     TEXT    NOT NULL,
+                params         TEXT    NOT NULL,
+                result         TEXT    NOT NULL,
+                created_at     TEXT    NOT NULL
+            );
+"""
+
 
 def _migrate_bgp_plans(conn: sqlite3.Connection) -> None:
     """Rebuild ``bgp_plans`` when it predates the ``retired`` status.
@@ -71,6 +88,55 @@ def _migrate_bgp_plans(conn: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_address_provisions(conn: sqlite3.Connection) -> None:
+    """Rebuild ``address_provisions`` when ``allocation_id`` cascades.
+
+    The original schema declared
+    ``allocation_id INTEGER NOT NULL REFERENCES allocations(id) ON DELETE
+    CASCADE``, so releasing a provisioned allocation (``DELETE
+    /pools/{id}/allocations/{request_id}``) deleted the linkage record too:
+    the ``bgp_plans`` row survived, and an identical retry could no longer
+    find its provision and failed with ``bgp_plan_id_conflict`` instead of
+    replaying.
+
+    Provision records must outlive the release of their allocation -- the
+    stored result, the plan and the idempotency key stay replayable -- so the
+    rebuilt table keeps ``allocation_id`` as a plain historical reference
+    without a foreign key, exactly like the unmigratable source references in
+    ``pool_migrations``.  ``plan_id`` and ``pool_id`` still cascade (deleting
+    the plan or the pool removes the record); every row, including ones whose
+    allocation has already been released in an old database, is copied
+    verbatim.
+    """
+
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'address_provisions'"
+    ).fetchone()
+    # Fresh database (created below) or already migrated: the new definition
+    # has no REFERENCES clause on allocation_id at all.
+    if row is None or "REFERENCES allocations" not in row["sql"]:
+        return
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("ALTER TABLE address_provisions RENAME TO address_provisions_legacy")
+        conn.execute(_ADDRESS_PROVISIONS_DDL)
+        conn.execute(
+            "INSERT INTO address_provisions (plan_id, pool_id, allocation_id, "
+            "request_id, params, result, created_at) "
+            "SELECT plan_id, pool_id, allocation_id, request_id, params, result, "
+            "created_at FROM address_provisions_legacy"
+        )
+        # Dropping the legacy table also drops its indexes (notably
+        # idx_address_provisions_request); init_db recreates them on the new
+        # table.
+        conn.execute("DROP TABLE address_provisions_legacy")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
 def _connect() -> sqlite3.Connection:
     directory = os.path.dirname(os.path.abspath(DB_PATH))
     os.makedirs(directory, exist_ok=True)
@@ -93,6 +159,7 @@ def _connect() -> sqlite3.Connection:
 def init_db() -> None:
     with get_conn() as conn:
         _migrate_bgp_plans(conn)
+        _migrate_address_provisions(conn)
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS pools (
@@ -185,19 +252,22 @@ def init_db() -> None:
             -- with it in a single write transaction.  plan_id is both the
             -- idempotency key of the provision and an FK to the bgp_plans row
             -- it created, so a plan_id taken by a standalone plan (or by a
-            -- previous provision) cannot be taken over here.  Deleting any of
-            -- the linked rows (the plan, the allocation or the pool) cascades
-            -- the provision record away.
-            CREATE TABLE IF NOT EXISTS address_provisions (
-                plan_id        TEXT    PRIMARY KEY
-                                  REFERENCES bgp_plans(plan_id) ON DELETE CASCADE,
-                pool_id        INTEGER NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
-                allocation_id  INTEGER NOT NULL REFERENCES allocations(id) ON DELETE CASCADE,
-                request_id     TEXT    NOT NULL,
-                params         TEXT    NOT NULL,
-                result         TEXT    NOT NULL,
-                created_at     TEXT    NOT NULL
-            );
+            -- previous provision) cannot be taken over here.  Deleting the
+            -- linked plan or pool cascades the provision record away.
+            --
+            -- allocation_id is intentionally a plain historical reference,
+            -- NOT a foreign key: releasing the provisioned allocation
+            -- (DELETE /pools/{id}/allocations/{request_id}) must not delete
+            -- this record.  The provision keeps being replayable by plan_id --
+            -- it returns the stored original allocation, announcement and
+            -- plan (with the plan's current status) instead of re-occupying
+            -- the released address or colliding with a plan_id that is still
+            -- occupied -- even if the freed request_id is later reused by an
+            -- ordinary allocation.  The schema migration in init_db rebuilds
+            -- older databases whose allocation_id carried ON DELETE CASCADE.
+            """
+            + _ADDRESS_PROVISIONS_DDL
+            + """
 
             -- Fast lookup of all plans belonging to one pool.
             CREATE INDEX IF NOT EXISTS idx_allocations_pool

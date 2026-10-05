@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 
 from fastapi.testclient import TestClient
@@ -479,3 +480,320 @@ def test_concurrent_same_plan_id_provisions_commit_once(client):
     assert set(cidrs) == {"203.0.113.0/25"}
     status = client.get(f"/pools/{pid}").json()
     assert len(status["allocated"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Releasing a provisioned allocation must not break the plan_id retry
+# ---------------------------------------------------------------------------
+
+
+def _release(client, pool_id, request_id):
+    resp = client.delete(f"/pools/{pool_id}/allocations/{request_id}")
+    assert resp.status_code == 200, resp.text
+    return resp.json()["released"]
+
+
+def test_provision_replay_after_release_returns_original(client):
+    pid = _create_pool(client)
+    first = _provision(client, pid, _body())
+    assert first.status_code == 201, first.text
+    original = first.json()
+
+    assert _release(client, pid, "order-1") == "203.0.113.0/25"
+
+    # The released address is free again and absent from current allocations.
+    status = client.get(f"/pools/{pid}").json()
+    assert status["allocated"] == []
+    assert status["free_cidrs"] == ["203.0.113.0/24"]
+
+    # Same plan_id + same params: replay the stored result; no address is
+    # taken again.
+    replay = _provision(client, pid, _body())
+    assert replay.status_code == 200, replay.text
+    data = replay.json()
+    assert data["replayed"] is True
+    assert data["allocation"]["replayed"] is True
+    assert data["plan"]["replayed"] is True
+    assert data["allocation"]["id"] == original["allocation"]["id"]
+    assert data["allocation"]["cidr"] == "203.0.113.0/25"
+    assert data["allocation"]["request_id"] == "order-1"
+    assert data["plan"]["plan_id"] == "plan-1"
+    assert data["new_announcement"]["prefix"] == "203.0.113.0/25"
+
+    # Still no current allocation, and the freed block stays fully free.
+    status = client.get(f"/pools/{pid}").json()
+    assert status["allocated"] == []
+    assert status["free_cidrs"] == ["203.0.113.0/24"]
+
+
+def test_provision_replay_after_release_reflects_current_plan_status(client):
+    pid = _create_pool(client)
+    assert _provision(client, pid, _body()).status_code == 201
+    assert client.post(
+        f"/pools/{pid}/bgp-plans/plan-1/activate"
+    ).status_code == 200
+
+    _release(client, pid, "order-1")
+    replay = _provision(client, pid, _body())
+    assert replay.status_code == 200, replay.text
+    plan = replay.json()["plan"]
+    assert plan["status"] == "active"
+    assert plan["activated_at"] is not None
+
+
+def test_released_request_id_can_be_reused_by_ordinary_allocation(client):
+    pid = _create_pool(client)
+    first = _provision(client, pid, _body())
+    assert first.status_code == 201
+    original_alloc_id = first.json()["allocation"]["id"]
+    _release(client, pid, "order-1")
+
+    # The freed request_id is reusable for an ordinary allocation.  The
+    # lowest free block is the same CIDR, but it is a brand-new row.
+    ordinary = client.post(
+        f"/pools/{pid}/allocations",
+        json={"request_id": "order-1", "prefix_length": 26},
+    )
+    assert ordinary.status_code == 201, ordinary.text
+    new_alloc = ordinary.json()
+    assert new_alloc["cidr"] == "203.0.113.0/26"
+    assert new_alloc["replayed"] is False
+    assert new_alloc["id"] != original_alloc_id
+
+    # The old provision still replays by plan_id against its *original*
+    # record, regardless of the request_id now pointing elsewhere.
+    replay = _provision(client, pid, _body())
+    assert replay.status_code == 200, replay.text
+    data = replay.json()
+    assert data["replayed"] is True
+    assert data["allocation"]["id"] == original_alloc_id
+    assert data["allocation"]["cidr"] == "203.0.113.0/25"
+    assert data["allocation"]["request_id"] == "order-1"
+
+    # The ordinary, current allocation is untouched and not the historical one.
+    status = client.get(f"/pools/{pid}").json()
+    assert [a["cidr"] for a in status["allocated"]] == ["203.0.113.0/26"]
+    assert status["allocated"][0]["request_id"] == "order-1"
+
+
+def test_changed_params_after_release_still_conflict(client):
+    pid = _create_pool(client)
+    assert _provision(client, pid, _body()).status_code == 201
+    _release(client, pid, "order-1")
+
+    # Different prefix_length with the same plan_id conflicts.
+    resp = _provision(client, pid, _body(prefix_length=26))
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "provision_id_conflict"
+
+    # Different request_id with the same plan_id conflicts too.
+    resp = _provision(client, pid, _body(request_id="other-order"))
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "provision_id_conflict"
+
+    # A standalone plan cannot take over the still-recorded plan_id either.
+    plan_resp = client.post(
+        f"/pools/{pid}/bgp-plans",
+        json={
+            "plan_id": "plan-1",
+            "relationships": RELATIONSHIPS,
+            "announcements": [
+                {"id": "whole", "prefix": "203.0.113.0/24", "as_path": [10, 100]}
+            ],
+        },
+    )
+    assert plan_resp.status_code == 409
+    assert plan_resp.json()["error"]["code"] == "bgp_plan_id_conflict"
+
+    # Nothing was allocated by the rejected attempts; the original replay is
+    # still intact.
+    assert client.get(f"/pools/{pid}").json()["allocated"] == []
+    replay = _provision(client, pid, _body())
+    assert replay.status_code == 200
+    assert replay.json()["allocation"]["cidr"] == "203.0.113.0/25"
+
+
+def test_different_plan_id_after_release_takes_the_freed_address(client):
+    pid = _create_pool(client)
+    assert _provision(client, pid, _body()).status_code == 201
+    _release(client, pid, "order-1")
+
+    # A genuinely new provision (new plan_id, new request_id) may take the
+    # freed block, while the old plan_id keeps conflicting on different params.
+    resp = _provision(
+        client,
+        pid,
+        _body(request_id="order-2", plan_id="plan-2"),
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["allocation"]["cidr"] == "203.0.113.0/25"
+    assert resp.json()["new_announcement"]["prefix"] == "203.0.113.0/25"
+
+    # The historical provision is unaffected and still replays verbatim.
+    replay = _provision(client, pid, _body())
+    assert replay.status_code == 200
+    assert replay.json()["allocation"]["cidr"] == "203.0.113.0/25"
+    assert replay.json()["plan"]["plan_id"] == "plan-1"
+
+    # Only the current allocation shows up in the pool status.
+    status = client.get(f"/pools/{pid}").json()
+    assert [a["request_id"] for a in status["allocated"]] == ["order-2"]
+
+
+def test_standalone_allocations_plans_and_handover_keep_working_after_release(client):
+    pid = _create_pool(client)
+    assert _provision(client, pid, _body()).status_code == 201
+    assert client.post(
+        f"/pools/{pid}/bgp-plans/plan-1/activate"
+    ).status_code == 200
+    _release(client, pid, "order-1")
+
+    # An independent ordinary allocation goes into the freed space.
+    cidr = _allocate(client, pid, "standalone", 25)
+    assert cidr == "203.0.113.0/25"
+
+    # A standalone plan can be created with a fresh plan_id and handed over
+    # from the active provision-created plan.
+    plan_body = {
+        "plan_id": "plan-2",
+        "relationships": RELATIONSHIPS,
+        "announcements": [
+            {"id": "new", "prefix": "203.0.113.0/25", "as_path": [10, 100]}
+        ],
+    }
+    assert client.post(f"/pools/{pid}/bgp-plans", json=plan_body).status_code == 201
+    handover = client.post(
+        f"/pools/{pid}/bgp-plans/handover",
+        json={"old_plan_ids": ["plan-1"], "new_plan_id": "plan-2"},
+    )
+    assert handover.status_code == 200, handover.text
+    statuses = {p["plan_id"]: p["status"] for p in handover.json()["plans"]}
+    assert statuses == {"plan-1": "retired", "plan-2": "active"}
+
+    # The released provision replay surfaces the current (retired) status.
+    replay = _provision(client, pid, _body())
+    assert replay.status_code == 200
+    assert replay.json()["plan"]["status"] == "retired"
+
+    # The independent allocation remains current; the historical one does not.
+    status = client.get(f"/pools/{pid}").json()
+    assert [a["request_id"] for a in status["allocated"]] == ["standalone"]
+
+
+# ---------------------------------------------------------------------------
+# Schema migration of databases whose provisions cascaded with allocations
+# ---------------------------------------------------------------------------
+
+# The address_provisions table as created before released provisions had to
+# stay replayable: allocation_id carried ON DELETE CASCADE.
+_LEGACY_ADDRESS_PROVISIONS_DDL = """
+CREATE TABLE address_provisions (
+    plan_id        TEXT    PRIMARY KEY
+                     REFERENCES bgp_plans(plan_id) ON DELETE CASCADE,
+    pool_id        INTEGER NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+    allocation_id  INTEGER NOT NULL REFERENCES allocations(id) ON DELETE CASCADE,
+    request_id     TEXT    NOT NULL,
+    params         TEXT    NOT NULL,
+    result         TEXT    NOT NULL,
+    created_at     TEXT    NOT NULL
+);
+CREATE INDEX idx_address_provisions_request ON address_provisions(request_id);
+"""
+
+
+def test_legacy_provision_table_is_migrated_and_remains_replayable(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "legacy-provision.db"
+    monkeypatch.setenv("SUBNET_DB_PATH", str(db_path))
+    from app import db as db_module
+
+    monkeypatch.setattr(db_module, "DB_PATH", str(db_path))
+    db_module.init_db()
+
+    from app.main import app
+
+    with TestClient(app) as client:
+        pid = _create_pool(client)
+        first = _provision(client, pid, _body())
+        assert first.status_code == 201, first.text
+        original = first.json()
+        allocation_id = original["allocation"]["id"]
+
+    # Rewind the address_provisions table to its old cascading definition,
+    # keeping the un-released provision row, to simulate a pre-fix database.
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript(
+            "ALTER TABLE address_provisions RENAME TO address_provisions_new;\n"
+            # The rename carries the old index with the table; drop it so the
+            # legacy CREATE INDEX below reproduces a real pre-fix database.
+            "DROP INDEX idx_address_provisions_request;\n"
+            + _LEGACY_ADDRESS_PROVISIONS_DDL
+            + """
+            INSERT INTO address_provisions (plan_id, pool_id, allocation_id,
+                request_id, params, result, created_at)
+            SELECT plan_id, pool_id, allocation_id, request_id, params, result,
+                created_at FROM address_provisions_new;
+            DROP TABLE address_provisions_new;
+            """
+        )
+        conn.commit()
+        legacy_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='address_provisions'"
+        ).fetchone()[0]
+        assert "REFERENCES allocations" in legacy_sql
+    finally:
+        conn.close()
+
+    # Upgrade: the table is rebuilt and the un-released provision row is
+    # copied verbatim.
+    db_module.init_db()
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='address_provisions'"
+        ).fetchone()[0]
+        assert "REFERENCES allocations" not in sql
+        assert "REFERENCES bgp_plans" in sql
+        row = conn.execute(
+            "SELECT allocation_id, request_id, params, result "
+            "FROM address_provisions WHERE plan_id = 'plan-1'"
+        ).fetchone()
+        assert row[0] == allocation_id
+        assert row[1] == "order-1"
+        indexes = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND tbl_name='address_provisions'"
+            )
+        }
+        assert "idx_address_provisions_request" in indexes
+    finally:
+        conn.close()
+
+    # The un-released legacy provision still replays after the upgrade...
+    with TestClient(app) as client:
+        replay = _provision(client, pid, _body())
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["replayed"] is True
+        assert replay.json()["allocation"]["id"] == allocation_id
+        assert replay.json()["allocation"]["cidr"] == "203.0.113.0/25"
+        assert replay.json()["plan"]["status"] == "planned"
+
+        # ...and once upgraded, releasing it no longer drops the record, so
+        # the identical retry keeps returning the original result while the
+        # freed address stays out of the pool's current allocations.
+        assert _release(client, pid, "order-1") == "203.0.113.0/25"
+        replay_after_release = _provision(client, pid, _body())
+        assert replay_after_release.status_code == 200
+        data = replay_after_release.json()
+        assert data["replayed"] is True
+        assert data["allocation"]["id"] == allocation_id
+        assert data["allocation"]["cidr"] == "203.0.113.0/25"
+        assert client.get(f"/pools/{pid}").json()["allocated"] == []

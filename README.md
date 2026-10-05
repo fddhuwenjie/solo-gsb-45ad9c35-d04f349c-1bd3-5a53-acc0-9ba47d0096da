@@ -32,7 +32,10 @@
   SQLite 写事务**内选取起始地址最小的对齐空闲子网、以选中 CIDR 补全新公告前缀，再用现有
   路径审计与计划覆盖规则校验**加入新分配后的全部**分配；成功才同时写入普通分配与 `planned`
   计划，并固定提交后的池状态摘要。空间不足、公告无效或覆盖冲突时两者都不留下
-  （`plan_id` 幂等重放；已被其他操作占用的 `request_id` / `plan_id` 不能接管）
+  （`plan_id` 幂等重放；已被其他操作占用的 `request_id` / `plan_id` 不能接管）。**释放**
+  已开通的分配只删除当前分配：开通记录与计划保留，同参重试仍返回原分配、原公告与计划的
+  当前状态（`replayed: true`），不会重新占用已释放地址；即使该 `request_id` 之后被普通
+  分配复用，旧开通仍按原记录重放
 - 一条命令启动，监听 **8000** 端口
 
 ## 快速开始
@@ -1086,7 +1089,15 @@ curl -X POST http://localhost:8000/pools/1/provisions \
 - 相同 `plan_id` + 相同请求参数（AS 关系去重排序、公告按 id 排序，与书写顺序无关）
   重试：返回原始分配与计划（HTTP 200，各级 `replayed: true`），不会二次分配或重复建计划；
   计划若已被单独激活/交接，重放返回其**当前** `active` / `retired` 状态；
-- 相同 `plan_id` 但任何参数变化：`409 provision_id_conflict`；
+- **释放后仍可重试**：`DELETE /pools/{id}/allocations/{request_id}` 只删除当前普通分配，
+  开通绑定记录与计划**保留**。释放后用相同 `plan_id` + 相同参数重试，同样返回原分配
+  （旧分配行 id 与原 CIDR）、原公告与计划当前状态（HTTP 200、`replayed: true`）：
+  **不会重新占用**已释放地址，池状态/空闲列表里也不出现这条历史分配；被释放的
+  `request_id` 可被一次**普通分配**自由复用，即使它后来恰好指向别处，旧开通仍严格按
+  `plan_id` 返回原记录；
+- 相同 `plan_id` 但任何参数变化：`409 provision_id_conflict`（释放前后均如此）；
+  释放后另一次开通换用原 `plan_id`、或单独计划创建接口占用原 `plan_id`，仍返回
+  `409 provision_id_conflict` / `409 bgp_plan_id_conflict`；
 - `request_id` 已被单笔分配、批量预留或另一次开通占用：`409 request_id_conflict`，
   不会复用该分配，也不会留下计划；
 - `plan_id` 已被单独创建的 BGP 计划（含已激活/已退役的）或另一次开通占用：
@@ -1097,6 +1108,73 @@ curl -X POST http://localhost:8000/pools/1/provisions \
 `bgp_plans` 记录，可被单独激活，也可作为交接的接班计划或旧计划参与 handover；其激活仍在
 独立写事务内重新核对**最新池状态**，池已漂移时同样拒绝。并发开通由 `BEGIN IMMEDIATE`
 串行化，`allocations.request_id` 唯一约束与 `bgp_plans.plan_id` 主键构成最后防线。
+
+**释放后重试的可执行示例**（沿用上面的池 1；该示例用空池重新创建池 2 以便直接复制运行）：
+
+```bash
+# 1) 建池并一次性开通：203.0.113.0/25 + plan release-1
+curl -s -X POST http://localhost:8000/pools \
+  -H 'Content-Type: application/json' \
+  -d '{"cidr": "203.0.113.0/24", "exclusions": []}'
+
+curl -s -X POST http://localhost:8000/pools/2/provisions \
+  -H 'Content-Type: application/json' -d '{
+    "request_id": "order-1",
+    "prefix_length": 25,
+    "plan_id": "release-1",
+    "relationships": [
+      {"type": "customer_provider", "customer": 10, "provider": 100}
+    ],
+    "announcements": [],
+    "new_announcement": {"id": "new", "as_path": [10, 100]}
+  }'
+
+# 2) 释放这次开通的分配
+curl -s -X DELETE http://localhost:8000/pools/2/allocations/order-1
+# {"released":"203.0.113.0/25","request_id":"order-1","pool_id":2}
+
+# 3) 相同 plan_id + 相同参数重试：HTTP 200、replayed: true，
+#    返回原分配（203.0.113.0/25、原分配行 id）、原公告与计划，地址不被重新占用
+curl -s -X POST http://localhost:8000/pools/2/provisions \
+  -H 'Content-Type: application/json' -d '{
+    "request_id": "order-1",
+    "prefix_length": 25,
+    "plan_id": "release-1",
+    "relationships": [
+      {"type": "customer_provider", "customer": 10, "provider": 100}
+    ],
+    "announcements": [],
+    "new_announcement": {"id": "new", "as_path": [10, 100]}
+  }'
+
+# 4) 池的当前分配列表为空，已释放地址不列入历史分配
+curl -s http://localhost:8000/pools/2
+
+# 5) 被释放的 request_id 可被一次普通分配复用（取到空闲的最小对齐子网）
+curl -s -X POST http://localhost:8000/pools/2/allocations \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id": "order-1", "prefix_length": 26}'
+# 203.0.113.0/26，新分配行；之后再重放旧开通仍返回原 203.0.113.0/25 记录
+
+# 6) 同一 plan_id 换参数重试：409 provision_id_conflict（地址与计划均不变）
+curl -s -X POST http://localhost:8000/pools/2/provisions \
+  -H 'Content-Type: application/json' -d '{
+    "request_id": "order-9",
+    "prefix_length": 25,
+    "plan_id": "release-1",
+    "relationships": [
+      {"type": "customer_provider", "customer": 10, "provider": 100}
+    ],
+    "announcements": [],
+    "new_announcement": {"id": "new", "as_path": [10, 100]}
+  }'
+# {"error":{"code":"provision_id_conflict",
+#           "detail":"plan_id 'release-1' already provisioned with different parameters"}}
+```
+
+> 旧版 SQLite 库（`address_provisions.allocation_id` 带 `ON DELETE CASCADE`）启动时会在
+> 单个事务内自动重建该表：`allocation_id` 改为不带外键的历史引用，未释放的开通记录按
+> `plan_id` 原样保留、升级后照常重试；`plan_id` / 池删除级联与请求 id 索引行为不变。
 
 ## 错误响应
 
@@ -1229,6 +1307,12 @@ curl -X POST http://localhost:8000/pools/1/provisions \
   公告无效或覆盖冲突时整体回滚，**普通分配与计划都不留下、两个幂等键都不被占用**；
   `allocations.request_id` 唯一约束、`bgp_plans.plan_id` 主键与 `address_provisions`
   绑定记录共同保证同一组键并发/重放只真正开通一次。
+  开通绑定记录的生命周期**独立于**其普通分配：`address_provisions.allocation_id` 只是
+  历史引用（不带外键级联），`DELETE /pools/{id}/allocations/{request_id}` 释放分配后记录
+  仍在，相同 `plan_id` 同参重试照旧重放原结果而不重新选址占用；仅在计划或池被删除时记录
+  才随级联移除。旧库升级时启动迁移会在单个事务内重建 `address_provisions` 表以解除该
+  级联，未释放的开通记录按 `plan_id` 原样保留、升级后仍可重试，按 request_id 的查询索引
+  同步重建。
 - 数据库开启 WAL 模式，读状态不会阻塞写分配。
 
 ## 项目结构

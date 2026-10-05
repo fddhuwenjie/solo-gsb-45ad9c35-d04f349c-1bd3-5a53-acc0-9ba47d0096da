@@ -39,6 +39,19 @@ failure or an origin conflict rolls the transaction back: neither the
 allocation nor the plan is left behind, and neither idempotency key is
 occupied.
 
+Releasing the allocation (``DELETE /pools/{id}/allocations/{request_id}``)
+removes the ordinary allocation row, but the provision record and the plan
+deliberately survive: ``address_provisions.allocation_id`` is only a
+historical reference, not a cascading foreign key.  Retrying the same
+``plan_id`` with identical parameters therefore still replays the stored
+original allocation (its old row id and CIDR, which is no longer occupied and
+never appears among the pool's current allocations), announcement and plan,
+with the plan's *current* status.  No address is re-allocated and the freed
+request_id stays free for an ordinary allocation; a later unrelated allocation
+that happens to reuse that request_id does not perturb the stored replay.
+Changing any parameter, or taking the plan_id with a different provision or a
+standalone plan, keeps returning the usual conflict.
+
 The stored plan is an ordinary ``bgp_plans`` row: the standalone plan create,
 activate and handover endpoints keep working unchanged, and activating a
 provision-created plan still re-verifies the latest pool state inside its own
