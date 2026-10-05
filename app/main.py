@@ -57,7 +57,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="IPv4 Subnet Allocation API",
-    version="1.9.0",
+    version="1.10.0",
     description=(
         "Allocate non-overlapping, aligned IPv4 subnets from address pools, "
         "reserve policy-gated batches of subnets atomically, "

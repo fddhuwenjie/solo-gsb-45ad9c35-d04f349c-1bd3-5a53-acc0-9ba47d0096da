@@ -43,6 +43,17 @@ The stored plan is an ordinary ``bgp_plans`` row: the standalone plan create,
 activate and handover endpoints keep working unchanged, and activating a
 provision-created plan still re-verifies the latest pool state inside its own
 write transaction.
+
+Releasing the provisioned allocation (``DELETE .../allocations/{request_id}``)
+deletes the allocation row but keeps both this linkage record (its
+``allocation_id`` becomes NULL, marking a historical provision) and the plan
+row.  A same-parameter retry therefore still finds the linkage and replays the
+original allocation snapshot, announcements and the plan's *current* status;
+it never re-allocates the released address.  The released ``request_id`` may
+meanwhile be reused by an ordinary allocation: the stored provision still
+replays by its own record, while a provision that changes any parameter keeps
+conflicting.  A plan_id that a standalone plan (or a different provision) now
+owns continues to conflict as before.
 """
 
 from __future__ import annotations
@@ -154,8 +165,12 @@ def provision_address(
         pool_net = parse_network(pool["cidr"])
 
         if previous is not None:
-            # Re-derive what the new-announcement prefix was from the stored
-            # result to compare the full fingerprint; a replay must match it.
+            # The linkage survives the allocation's release (allocation_id is
+            # NULL then), so an exact retry after release still replays the
+            # original record instead of colliding with the surviving plan
+            # row.  Re-derive what the new-announcement prefix was from the
+            # stored result to compare the full fingerprint; a replay must
+            # match it.
             stored = json.loads(previous["result"])
             stored_cidr = stored["new_announcement"]["prefix"]
             params_json = _provision_params(

@@ -32,7 +32,9 @@
   SQLite 写事务**内选取起始地址最小的对齐空闲子网、以选中 CIDR 补全新公告前缀，再用现有
   路径审计与计划覆盖规则校验**加入新分配后的全部**分配；成功才同时写入普通分配与 `planned`
   计划，并固定提交后的池状态摘要。空间不足、公告无效或覆盖冲突时两者都不留下
-  （`plan_id` 幂等重放；已被其他操作占用的 `request_id` / `plan_id` 不能接管）
+  （`plan_id` 幂等重放；已被其他操作占用的 `request_id` / `plan_id` 不能接管）。开通的
+  分配被释放后，同参重试仍返回**原分配、公告与计划**（`replayed: true`，计划状态反映当前
+  值）而不重新占用地址；释放出的 `request_id` 被普通分配复用时旧开通仍按原记录重放
 - 一条命令启动，监听 **8000** 端口
 
 ## 快速开始
@@ -1086,11 +1088,48 @@ curl -X POST http://localhost:8000/pools/1/provisions \
 - 相同 `plan_id` + 相同请求参数（AS 关系去重排序、公告按 id 排序，与书写顺序无关）
   重试：返回原始分配与计划（HTTP 200，各级 `replayed: true`），不会二次分配或重复建计划；
   计划若已被单独激活/交接，重放返回其**当前** `active` / `retired` 状态；
-- 相同 `plan_id` 但任何参数变化：`409 provision_id_conflict`；
+- **释放后重试**：开通的分配被 `DELETE /pools/{id}/allocations/{request_id}` 释放后，
+  开通绑定记录与计划行**仍保留**（绑定记录的分配引用置空，标记为历史开通）。以**完全相同
+  的参数**重试仍返回原分配、公告与计划（HTTP 200，`replayed: true`，计划状态反映当前值），
+  **不会重新占用已释放的地址**，历史分配也**不会**出现在池的当前分配列表与空闲计算之外；
+  即使释放出的 `request_id` 后来被一笔普通分配复用，旧开通依旧按其原记录重放（返回的是
+  原 CIDR/前缀，而非复用该 id 的新分配）；
+- 相同 `plan_id` 但任何参数变化（含释放后改参）：`409 provision_id_conflict`；
 - `request_id` 已被单笔分配、批量预留或另一次开通占用：`409 request_id_conflict`，
   不会复用该分配，也不会留下计划；
 - `plan_id` 已被单独创建的 BGP 计划（含已激活/已退役的）或另一次开通占用：
   `409 bgp_plan_id_conflict`，不会留下分配。
+
+**释放后重试的可执行示例**（承接前面的开通，池 1）：
+
+```bash
+# 1) 释放开通占用的 203.0.113.128/25
+curl -X DELETE http://localhost:8000/pools/1/allocations/order-2026-10-04
+# {"released":"203.0.113.128/25","request_id":"order-2026-10-04","pool_id":1}
+
+# 2) 池状态：当前分配里不再有该地址，空间已整体回收
+curl http://localhost:8000/pools/1
+
+# 3) 同参重试：返回原分配、公告与计划（HTTP 200, replayed: true），不重新选址
+curl -X POST http://localhost:8000/pools/1/provisions \
+  -H 'Content-Type: application/json' -d '{
+    "request_id": "order-2026-10-04",
+    "prefix_length": 25,
+    "plan_id": "release-2026-10-04",
+    "relationships": [
+      {"type": "customer_provider", "customer": 10,  "provider": 100},
+      {"type": "peer",               "a": 100, "b": 50},
+      {"type": "customer_provider", "customer": 60,  "provider": 50}
+    ],
+    "announcements": [
+      {"id": "cur-0", "prefix": "203.0.113.0/25", "as_path": [10, 100]}
+    ],
+    "new_announcement": {"id": "cur-128", "as_path": [100, 50, 60]}
+  }'
+
+# 4) 换参数（例如 prefix_length 改为 26）仍按冲突处理：
+#    HTTP 409 {"error":{"code":"provision_id_conflict", ...}}
+```
 
 **与既有接口的关系**：单独分配（`POST /pools/{id}/allocations`）、单独计划创建
 （`POST /pools/{id}/bgp-plans`）与激活/交接接口全部继续可用。开通产生的计划就是一条普通
@@ -1228,7 +1267,11 @@ curl -X POST http://localhost:8000/pools/1/provisions \
   单个 `BEGIN IMMEDIATE` 写事务内完成：并发开通被串行化，不会选中同一块空间；空间不足、
   公告无效或覆盖冲突时整体回滚，**普通分配与计划都不留下、两个幂等键都不被占用**；
   `allocations.request_id` 唯一约束、`bgp_plans.plan_id` 主键与 `address_provisions`
-  绑定记录共同保证同一组键并发/重放只真正开通一次。
+  绑定记录共同保证同一组键并发/重放只真正开通一次。释放开通的分配只把绑定记录的
+  `allocation_id` 置空（`ON DELETE SET NULL`）而**不删除记录**，因此释放后同参重试仍重放
+  原开通而不会撞上残存计划行的 `bgp_plan_id_conflict`；旧库升级时启动迁移会在单个事务内
+  重建 `address_provisions` 表（由旧的级联删除改为置空），全部已存开通记录（含尚未释放的）
+  原样保留，升级后既可重试未释放的开通，也获得释放后重放能力。
 - 数据库开启 WAL 模式，读状态不会阻塞写分配。
 
 ## 项目结构

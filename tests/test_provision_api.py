@@ -161,6 +161,202 @@ def test_provision_replay_after_activation_reflects_active(client):
     assert replay.json()["plan"]["activated_at"] is not None
 
 
+def _release(client, pool_id, request_id):
+    resp = client.delete(f"/pools/{pool_id}/allocations/{request_id}")
+    assert resp.status_code == 200, resp.text
+    return resp
+
+
+def test_provision_replay_after_release_returns_original_without_reallocating(client):
+    pid = _create_pool(client)
+    first = _provision(client, pid, _body())
+    assert first.status_code == 201
+    original = first.json()
+    _release(client, pid, "order-1")
+
+    # The released address is free again and absent from the current list.
+    status = client.get(f"/pools/{pid}").json()
+    assert status["allocated"] == []
+    assert status["free_cidrs"] == ["203.0.113.0/24"]
+
+    # An exact retry replays the original allocation, announcements and plan;
+    # it does not re-occupy the released address.
+    retry = _provision(client, pid, _body())
+    assert retry.status_code == 200, retry.text
+    replay = retry.json()
+    assert replay["replayed"] is True
+    assert replay["allocation"]["replayed"] is True
+    assert replay["plan"]["replayed"] is True
+    assert replay["allocation"]["id"] == original["allocation"]["id"]
+    assert replay["allocation"]["cidr"] == "203.0.113.0/25"
+    assert replay["allocation"]["request_id"] == "order-1"
+    assert replay["new_announcement"]["prefix"] == "203.0.113.0/25"
+    assert replay["plan"]["plan_id"] == "plan-1"
+    assert replay["plan"]["status"] == "planned"
+
+    # The historical allocation still does not appear among current
+    # allocations, and no second allocation/plan was created.
+    status = client.get(f"/pools/{pid}").json()
+    assert status["allocated"] == []
+    assert status["free_cidrs"] == ["203.0.113.0/24"]
+
+
+def test_provision_replay_after_release_reflects_current_plan_status(client):
+    pid = _create_pool(client)
+    assert _provision(client, pid, _body()).status_code == 201
+    # Activate while the pool still matches the pinned digest, then release.
+    assert client.post(
+        f"/pools/{pid}/bgp-plans/plan-1/activate"
+    ).status_code == 200
+    _release(client, pid, "order-1")
+
+    # The plan row survives the release and keeps its current status; the
+    # replay surfaces that current status rather than the stored one.
+    replay = _provision(client, pid, _body())
+    assert replay.status_code == 200
+    assert replay.json()["plan"]["status"] == "active"
+    assert replay.json()["plan"]["activated_at"] is not None
+
+
+def test_provision_changed_params_after_release_still_conflict(client):
+    pid = _create_pool(client)
+    assert _provision(client, pid, _body()).status_code == 201
+    _release(client, pid, "order-1")
+
+    changed = _body(prefix_length=26)
+    resp = _provision(client, pid, changed)
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "provision_id_conflict"
+    # The conflict did not allocate the released address.
+    assert client.get(f"/pools/{pid}").json()["allocated"] == []
+
+
+def test_provision_replay_after_request_id_reused_by_normal_allocation(client):
+    pid = _create_pool(client)
+    first = _provision(client, pid, _body())
+    assert first.status_code == 201
+    _release(client, pid, "order-1")
+
+    # The released request_id is reused by an ordinary standalone allocation
+    # (different prefix length, so a different CIDR).
+    reused = client.post(
+        f"/pools/{pid}/allocations",
+        json={"request_id": "order-1", "prefix_length": 26},
+    )
+    assert reused.status_code == 201, reused.text
+    assert reused.json()["cidr"] == "203.0.113.0/26"
+
+    # The old provision still replays from its own record: original /25, not
+    # the current /26 carrying the same request_id.
+    retry = _provision(client, pid, _body())
+    assert retry.status_code == 200, retry.text
+    replay = retry.json()
+    assert replay["replayed"] is True
+    assert replay["allocation"]["cidr"] == "203.0.113.0/25"
+    assert replay["allocation"]["prefix_length"] == 25
+
+    # The pool's current allocation list shows only the live /26; the
+    # historical /25 is not listed.
+    status = client.get(f"/pools/{pid}").json()
+    assert [(a["cidr"], a["request_id"], a["prefix_length"]) for a in status["allocated"]] == [
+        ("203.0.113.0/26", "order-1", 26)
+    ]
+
+
+def test_provision_other_plan_still_occupies_released_provision_plan_id(client):
+    pid = _create_pool(client)
+    assert _provision(client, pid, _body()).status_code == 201
+    _release(client, pid, "order-1")
+
+    # A different provision reusing the plan_id with different parameters
+    # keeps conflicting (the surviving linkage owns the key)...
+    resp = _provision(
+        client,
+        pid,
+        _body(
+            request_id="order-2",
+            prefix_length=26,
+            new_id="new2",
+        ),
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "provision_id_conflict"
+
+    # ...and a standalone BGP plan cannot take over the plan_id either,
+    # because the provision's plan row still exists.
+    plan_resp = client.post(
+        f"/pools/{pid}/bgp-plans",
+        json={
+            "plan_id": "plan-1",
+            "relationships": [
+                {"type": "customer_provider", "customer": 10, "provider": 100}
+            ],
+            "announcements": [
+                {"id": "p", "prefix": "203.0.113.0/24", "as_path": [10, 100]}
+            ],
+        },
+    )
+    assert plan_resp.status_code == 409
+    assert plan_resp.json()["error"]["code"] == "bgp_plan_id_conflict"
+    assert client.get(f"/pools/{pid}").json()["allocated"] == []
+
+
+def test_provision_release_keeps_standalone_allocations_plans_and_handover(client):
+    pid = _create_pool(client)
+    assert _provision(client, pid, _body()).status_code == 201
+    _release(client, pid, "order-1")
+
+    # Standalone allocation + a fresh, independently keyed provision still
+    # work after the release.
+    assert _allocate(client, pid, "standalone", 25) == "203.0.113.0/25"
+    second = _provision(
+        client,
+        pid,
+        _body(
+            request_id="order-2",
+            plan_id="plan-2",
+            announcements=[
+                {"id": "cur", "prefix": "203.0.113.0/25", "as_path": [10, 100]}
+            ],
+            new_path=(10, 100),
+        ),
+    )
+    assert second.status_code == 201, second.text
+    assert second.json()["allocation"]["cidr"] == "203.0.113.128/25"
+
+    # Activate the new provision's plan, then hand it over to a standalone
+    # successor plan covering the whole pool.
+    assert client.post(
+        f"/pools/{pid}/bgp-plans/plan-2/activate"
+    ).status_code == 200
+    successor = client.post(
+        f"/pools/{pid}/bgp-plans",
+        json={
+            "plan_id": "plan-3",
+            "relationships": [
+                {"type": "customer_provider", "customer": 10, "provider": 100}
+            ],
+            "announcements": [
+                {"id": "whole", "prefix": "203.0.113.0/24", "as_path": [10, 100]}
+            ],
+        },
+    )
+    assert successor.status_code == 201, successor.text
+    handover = client.post(
+        f"/pools/{pid}/bgp-plans/handover",
+        json={"old_plan_ids": ["plan-2"], "new_plan_id": "plan-3"},
+    )
+    assert handover.status_code == 200, handover.text
+    statuses = {p["plan_id"]: p["status"] for p in handover.json()["plans"]}
+    assert statuses == {"plan-2": "retired", "plan-3": "active"}
+
+    # The released first provision still replays untouched (its plan was
+    # never part of the handover).
+    replay = _provision(client, pid, _body())
+    assert replay.status_code == 200
+    assert replay.json()["plan"]["status"] == "planned"
+
+
 def test_provision_replay_changed_allocation_params_conflicts(client):
     pid = _create_pool(client)
     assert _provision(client, pid, _body()).status_code == 201
